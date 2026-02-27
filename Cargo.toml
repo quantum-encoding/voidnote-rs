@@ -1,0 +1,51 @@
+[package]
+name        = "voidnote"
+version     = "0.1.0"
+edition     = "2021"
+description = "Official Rust SDK for VoidNote — zero-knowledge self-destructing notes"
+license     = "MIT"
+repository  = "https://github.com/quantum-encoding/voidnote-rust"
+keywords    = ["voidnote", "encryption", "zero-knowledge", "self-destructing", "notes"]
+categories  = ["cryptography", "web-programming::http-client"]
+readme      = "README.md"
+
+[lib]
+name = "voidnote"
+path = "src/lib.rs"
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
+
+[dependencies]
+# HTTP client — async with streaming response body support
+reqwest  = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# AES-256-GCM (pure Rust, no OpenSSL)
+aes-gcm  = "0.10"
+
+# SHA-256 for key derivation (pure Rust)
+sha2     = "0.10"
+
+# Hex encoding/decoding
+hex      = "0.4"
+
+# JSON
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async runtime (optional: users may bring their own)
+tokio = { version = "1", features = ["full"] }
+
+# Stream combinators
+futures-core = "0.3"
+futures      = "0.3"
+
+# Ergonomic async generators for Stream impl
+async-stream = "0.3"
+
+# Byte utilities for SSE parsing
+bytes = "1"
+
+[dev-dependencies]
+tokio-test = "0.4"
