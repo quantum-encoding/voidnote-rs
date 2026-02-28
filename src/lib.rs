@@ -161,17 +161,48 @@ pub async fn read(url_or_token: &str) -> Result<ReadResult> {
 
 /// Like [`read`] but allows overriding the API base URL.
 pub async fn read_from(url_or_token: &str, base: &str) -> Result<ReadResult> {
-    let token = extract_token(url_or_token)?;
-    let token_id = &token[..32];
-    let secret = &token[32..];
+    let parsed = parse_note_url(url_or_token)?;
 
-    let url = format!("{base}/api/note/{token_id}");
+    match parsed {
+        ParsedUrl::V1 { token_id, secret } => read_v1(&token_id, &secret, base).await,
+        ParsedUrl::Legacy { full_token } => read_legacy(&full_token, base).await,
+    }
+}
+
+enum ParsedUrl {
+    V1 { token_id: String, secret: String },
+    Legacy { full_token: String },
+}
+
+fn parse_note_url(input: &str) -> Result<ParsedUrl> {
+    // v1 format: .../n/{32-hex}#{32-hex}
+    if let Some(hash_pos) = input.find('#') {
+        let secret = &input[hash_pos + 1..];
+        let before = input[..hash_pos].trim_end_matches('/');
+        let token_id = before.rsplit('/').next().unwrap_or("");
+        if token_id.len() == 32 && secret.len() == 32
+            && token_id.chars().all(|c| c.is_ascii_hexdigit())
+            && secret.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return Ok(ParsedUrl::V1 {
+                token_id: token_id.to_lowercase(),
+                secret: secret.to_lowercase(),
+            });
+        }
+    }
+    // Legacy: 64-char hex token in path or raw
+    let token = extract_token(input)?;
+    Ok(ParsedUrl::Legacy { full_token: token })
+}
+
+/// Fetch encrypted blob via v1 API and decrypt client-side (true zero-knowledge).
+async fn read_v1(token_id: &str, secret: &str, base: &str) -> Result<ReadResult> {
+    let url = format!("{base}/api/v1/note/{token_id}/consume");
     let resp = reqwest::get(&url).await?;
-
     let status = resp.status().as_u16();
     let body = resp.text().await?;
 
-    if status == 404 {
+    if status == 410 || status == 404 {
         return Err(Error::Http {
             status,
             body: "note not found or already destroyed".into(),
@@ -181,13 +212,49 @@ pub async fn read_from(url_or_token: &str, base: &str) -> Result<ReadResult> {
         return Err(Error::Http { status, body });
     }
 
-    // The API uses a mix of snake_case and camelCase; accept both.
     #[derive(Deserialize)]
-    struct RawResponse {
-        encrypted_content: Option<String>,
+    struct ConsumeResponse {
+        encrypted: String,
         iv: String,
+        #[serde(default)]
+        views_remaining: u32,
+        #[serde(default)]
+        destroyed: bool,
+    }
+
+    let raw: ConsumeResponse = serde_json::from_str(&body)?;
+    let content = decrypt_content(&raw.encrypted, &raw.iv, secret)?;
+
+    Ok(ReadResult {
+        content,
+        title: None,
+        view_count: 1,
+        max_views: raw.views_remaining + 1,
+        destroyed: raw.destroyed,
+    })
+}
+
+/// Fetch and decrypt via legacy server-decrypt endpoint (backward compat).
+async fn read_legacy(full_token: &str, base: &str) -> Result<ReadResult> {
+    let url = format!("{base}/api/note/{full_token}");
+    let resp = reqwest::get(&url).await?;
+    let status = resp.status().as_u16();
+    let body = resp.text().await?;
+
+    if status == 404 || status == 410 {
+        return Err(Error::Http {
+            status,
+            body: "note not found or already destroyed".into(),
+        });
+    }
+    if status != 200 {
+        return Err(Error::Http { status, body });
+    }
+
+    #[derive(Deserialize)]
+    struct LegacyResponse {
+        content: String,
         title: Option<String>,
-        // Accept both naming conventions
         #[serde(alias = "viewCount", default)]
         view_count: u32,
         #[serde(alias = "maxViews", default)]
@@ -196,13 +263,9 @@ pub async fn read_from(url_or_token: &str, base: &str) -> Result<ReadResult> {
         destroyed: bool,
     }
 
-    let raw: RawResponse = serde_json::from_str(&body)?;
-    let enc_hex = raw.encrypted_content.as_deref().unwrap_or_default();
-
-    let content = decrypt_content(enc_hex, &raw.iv, secret)?;
-
+    let raw: LegacyResponse = serde_json::from_str(&body)?;
     Ok(ReadResult {
-        content,
+        content: raw.content,
         title: raw.title,
         view_count: raw.view_count,
         max_views: raw.max_views,
@@ -210,47 +273,42 @@ pub async fn read_from(url_or_token: &str, base: &str) -> Result<ReadResult> {
     })
 }
 
-/// Create and encrypt a VoidNote client-side. Requires an API key.
-/// The server never sees the plaintext.
+/// Create and encrypt a VoidNote client-side using the v1 API.
+/// The server generates the tokenId; the client holds the secret in the URL fragment.
+/// The server never sees the plaintext or the secret.
+/// Returns a URL in the form https://voidnote.net/n/{tokenId}#{secret}.
 pub async fn create(content: &str, opts: CreateOptions) -> Result<CreateResult> {
     if opts.api_key.is_empty() {
         return Err(Error::MissingApiKey);
     }
     let base = opts.base.as_deref().unwrap_or(DEFAULT_BASE);
 
-    let (full_token, token_id, secret) = generate_token();
+    // Generate only the secret (16 bytes) — server generates tokenId
+    let secret = generate_secret();
     let (enc_hex, iv_hex) = encrypt_content(content, &secret)?;
 
     let max_views = opts.max_views.unwrap_or(1);
+    let expires_in_secs = opts.expires_in.unwrap_or(1) as u32 * 3600; // hours → seconds
 
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct CreateBody<'a> {
-        token_id: &'a str,
-        encrypted_content: &'a str,
+        encrypted: &'a str,
         iv: &'a str,
-        max_views: u8,
-        title: Option<&'a str>,
-        expires_in: u16,
-        note_type: &'a str,
+        expires_in: u32,
+        view_limit: u8,
     }
 
-    let expires_in = opts.expires_in.unwrap_or(24);
-    let note_type_str = opts.note_type.as_deref().unwrap_or("secure").to_owned();
-
     let payload = CreateBody {
-        token_id: &token_id,
-        encrypted_content: &enc_hex,
+        encrypted: &enc_hex,
         iv: &iv_hex,
-        max_views,
-        title: opts.title.as_deref(),
-        expires_in,
-        note_type: &note_type_str,
+        expires_in: expires_in_secs,
+        view_limit: max_views,
     };
 
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("{base}/api/notes"))
+        .post(format!("{base}/api/v1/note"))
         .bearer_auth(&opts.api_key)
         .json(&payload)
         .send()
@@ -266,19 +324,62 @@ pub async fn create(content: &str, opts: CreateOptions) -> Result<CreateResult> 
     #[derive(Deserialize, Default)]
     #[serde(default)]
     struct CreateResponse {
-        #[serde(rename = "siteUrl")]
-        site_url: Option<String>,
-        #[serde(rename = "expiresAt", alias = "expires_at")]
+        token: Option<String>,
+        url: Option<String>,
+        #[serde(rename = "expiresAt")]
         expires_at: Option<String>,
     }
 
     let raw: CreateResponse = serde_json::from_str(&body).unwrap_or_default();
-    let site = raw.site_url.as_deref().unwrap_or(base);
+    let base_url = raw.url.unwrap_or_else(|| format!("{base}/n/{}", raw.token.as_deref().unwrap_or("")));
 
     Ok(CreateResult {
-        url: format!("{site}/note/{full_token}"),
+        // Append #secret — this is the only place the secret and URL are combined
+        url: format!("{base_url}#{secret}"),
         expires_at: raw.expires_at.unwrap_or_default(),
     })
+}
+
+/// Peek at note metadata without consuming a view.
+/// Accepts v1 URLs (https://voidnote.net/n/{tokenId}#{secret}) or raw 32-char tokenIds.
+pub async fn peek(url_or_token: &str, base: Option<&str>) -> Result<PeekResult> {
+    let api_base = base.unwrap_or(DEFAULT_BASE);
+
+    // Extract tokenId: strip fragment, get last path segment
+    let without_fragment = url_or_token.split('#').next().unwrap_or(url_or_token);
+    let last_seg = without_fragment.trim_end_matches('/').rsplit('/').next().unwrap_or(without_fragment);
+    let token_id = if last_seg.len() == 64 && last_seg.chars().all(|c| c.is_ascii_hexdigit()) {
+        &last_seg[..32] // legacy: take first half
+    } else {
+        last_seg
+    };
+
+    let resp = reqwest::get(format!("{api_base}/api/v1/note/{token_id}/meta")).await?;
+    let status = resp.status().as_u16();
+    let body = resp.text().await?;
+
+    if status != 200 {
+        return Err(Error::Http { status, body });
+    }
+
+    let raw: PeekResult = serde_json::from_str(&body)?;
+    Ok(raw)
+}
+
+/// Metadata about a note (from the /meta endpoint).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PeekResult {
+    pub exists: bool,
+    #[serde(rename = "type", default)]
+    pub note_type: String,
+    #[serde(rename = "createdAt", default)]
+    pub created_at: String,
+    #[serde(rename = "expiresAt", default)]
+    pub expires_at: String,
+    #[serde(rename = "viewLimit", default)]
+    pub view_limit: u32,
+    #[serde(rename = "viewsRemaining", default)]
+    pub views_remaining: u32,
 }
 
 /// Create a new Void Stream. Requires an API key. Costs 1 credit.
@@ -794,7 +895,7 @@ fn decrypt_with_key(enc_hex: &str, iv_hex: &str, key: &[u8; 32]) -> Result<Strin
     String::from_utf8(plaintext).map_err(|_| Error::DecryptionFailed)
 }
 
-/// Extract the 64-char hex token from a URL or return the raw string.
+/// Extract the 64-char hex token from a legacy URL or raw string.
 fn extract_token(url_or_token: &str) -> Result<String> {
     let s = if url_or_token.starts_with("http") {
         url_or_token
@@ -810,6 +911,14 @@ fn extract_token(url_or_token: &str) -> Result<String> {
         return Err(Error::InvalidToken);
     }
     Ok(s.to_lowercase())
+}
+
+/// Generate a 16-byte (32-hex-char) secret for use with the v1 API.
+fn generate_secret() -> String {
+    use aes_gcm::aead::rand_core::RngCore;
+    let mut raw = [0u8; 16];
+    OsRng.fill_bytes(&mut raw);
+    hex_encode(raw)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
