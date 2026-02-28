@@ -121,6 +121,10 @@ pub struct CreateOptions {
     pub title: Option<String>,
     /// 1–100; defaults to 1
     pub max_views: Option<u8>,
+    /// Hours until expiry. Valid values: 1, 6, 24, 72, 168, 720. Defaults to 24.
+    pub expires_in: Option<u16>,
+    /// Note type: "secure" (default, confirm to reveal) or "pipe" (auto-reveal for scripts).
+    pub note_type: Option<String>,
     /// Override the API base URL (default: https://voidnote.net)
     pub base: Option<String>,
 }
@@ -227,7 +231,12 @@ pub async fn create(content: &str, opts: CreateOptions) -> Result<CreateResult> 
         iv: &'a str,
         max_views: u8,
         title: Option<&'a str>,
+        expires_in: u16,
+        note_type: &'a str,
     }
+
+    let expires_in = opts.expires_in.unwrap_or(24);
+    let note_type_str = opts.note_type.as_deref().unwrap_or("secure").to_owned();
 
     let payload = CreateBody {
         token_id: &token_id,
@@ -235,6 +244,8 @@ pub async fn create(content: &str, opts: CreateOptions) -> Result<CreateResult> 
         iv: &iv_hex,
         max_views,
         title: opts.title.as_deref(),
+        expires_in,
+        note_type: &note_type_str,
     };
 
     let client = reqwest::Client::new();
@@ -539,6 +550,145 @@ pub mod stream {
     }
 }
 
+// ── Buy / Credits API ─────────────────────────────────────────────────────────
+
+/// Options for creating a cryptocurrency payment order.
+#[derive(Debug, Clone)]
+pub struct CryptoOrderOptions {
+    /// Required: vn_... API key from your dashboard
+    pub api_key: String,
+    /// Number of credits to purchase
+    pub credits: u32,
+    /// Cryptocurrency ticker symbol (e.g. "BTC", "ETH", "LTC")
+    pub currency: String,
+    /// Override the API base URL (default: https://voidnote.net)
+    pub base: Option<String>,
+}
+
+/// A cryptocurrency payment order returned by the API.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CryptoOrder {
+    /// Unique order identifier
+    pub order_id: String,
+    /// Wallet address to send payment to
+    pub address: String,
+    /// Amount to send in the requested cryptocurrency
+    pub amount: String,
+    /// Cryptocurrency ticker (e.g. "BTC")
+    pub currency: String,
+    /// Number of credits that will be added on payment
+    pub credits: u32,
+    /// ISO 8601 timestamp when the order expires
+    pub expires_at: String,
+}
+
+/// Options for submitting a cryptocurrency transaction for an existing order.
+#[derive(Debug, Clone)]
+pub struct SubmitPaymentOptions {
+    /// Required: vn_... API key from your dashboard
+    pub api_key: String,
+    /// Order ID returned by [`create_crypto_order`]
+    pub order_id: String,
+    /// On-chain transaction hash / TXID
+    pub tx_hash: String,
+    /// Override the API base URL (default: https://voidnote.net)
+    pub base: Option<String>,
+}
+
+/// Result of submitting a cryptocurrency payment transaction.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitPaymentResult {
+    /// Whether the submission was accepted
+    pub success: bool,
+    /// Human-readable status message
+    pub message: String,
+    /// Current status of the order (e.g. "pending", "confirming", "complete")
+    pub status: String,
+}
+
+/// Create a cryptocurrency payment order to purchase credits.
+///
+/// Returns a [`CryptoOrder`] containing the wallet address and exact amount to send.
+pub async fn create_crypto_order(opts: CryptoOrderOptions) -> Result<CryptoOrder> {
+    if opts.api_key.is_empty() {
+        return Err(Error::MissingApiKey);
+    }
+    let base = opts.base.as_deref().unwrap_or(DEFAULT_BASE);
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct OrderBody {
+        credits: u32,
+        currency: String,
+    }
+
+    let payload = OrderBody {
+        credits: opts.credits,
+        currency: opts.currency.clone(),
+    };
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/api/buy/crypto/create-order"))
+        .bearer_auth(&opts.api_key)
+        .json(&payload)
+        .send()
+        .await?;
+
+    let status = resp.status().as_u16();
+    let body = resp.text().await?;
+
+    if status != 200 && status != 201 {
+        return Err(Error::Http { status, body });
+    }
+
+    let order: CryptoOrder = serde_json::from_str(&body)?;
+    Ok(order)
+}
+
+/// Submit an on-chain transaction hash for an existing crypto payment order.
+///
+/// Call this after broadcasting your transaction. The API will monitor the
+/// blockchain and credit your account once the required confirmations are reached.
+pub async fn submit_crypto_payment(opts: SubmitPaymentOptions) -> Result<SubmitPaymentResult> {
+    if opts.api_key.is_empty() {
+        return Err(Error::MissingApiKey);
+    }
+    let base = opts.base.as_deref().unwrap_or(DEFAULT_BASE);
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct SubmitBody {
+        order_id: String,
+        tx_hash: String,
+    }
+
+    let payload = SubmitBody {
+        order_id: opts.order_id.clone(),
+        tx_hash: opts.tx_hash.clone(),
+    };
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/api/buy/crypto/submit-tx"))
+        .bearer_auth(&opts.api_key)
+        .json(&payload)
+        .send()
+        .await?;
+
+    let status = resp.status().as_u16();
+    let body = resp.text().await?;
+
+    if status != 200 && status != 201 {
+        return Err(Error::Http { status, body });
+    }
+
+    let result: SubmitPaymentResult = serde_json::from_str(&body)?;
+    Ok(result)
+}
+
 // ── Blocking wrappers ─────────────────────────────────────────────────────────
 
 /// Synchronous wrapper around the async API.
@@ -563,6 +713,16 @@ pub mod blocking {
     /// Blocking version of [`create_stream`].
     pub fn create_stream(opts: StreamOptions) -> Result<StreamHandle> {
         rt().block_on(super::create_stream(opts))
+    }
+
+    /// Blocking version of [`create_crypto_order`].
+    pub fn create_crypto_order(opts: CryptoOrderOptions) -> Result<CryptoOrder> {
+        rt().block_on(super::create_crypto_order(opts))
+    }
+
+    /// Blocking version of [`submit_crypto_payment`].
+    pub fn submit_crypto_payment(opts: SubmitPaymentOptions) -> Result<SubmitPaymentResult> {
+        rt().block_on(super::submit_crypto_payment(opts))
     }
 }
 
