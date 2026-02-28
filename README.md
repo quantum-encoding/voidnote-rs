@@ -1,17 +1,14 @@
-# voidnote — Official Rust SDK
+# voidnote
 
-Zero-knowledge self-destructing notes and live encrypted streams.
-The key lives in the link. We never see it.
+Official Rust SDK for [VoidNote](https://voidnote.net) — zero-knowledge self-destructing notes and live encrypted streams.
 
-**https://voidnote.net**
-
----
+**v0.3.0** · Rust 1.75+ · pure-Rust crypto, no OpenSSL · async + blocking API · zero-knowledge v1 API
 
 ## Install
 
 ```toml
 [dependencies]
-voidnote = "0.1"
+voidnote = "0.3"
 ```
 
 Or with Cargo:
@@ -24,68 +21,98 @@ cargo add voidnote
 
 ## Quick start
 
-### Read a note
-
 ```rust
-use voidnote::read;
+use voidnote::{create, CreateOptions};
 
-let note = read("https://voidnote.net/note/<token>").await?;
-println!("{}", note.content);
-println!("views: {}/{}", note.view_count, note.max_views);
-println!("destroyed: {}", note.destroyed);
+#[tokio::main]
+async fn main() -> voidnote::Result<()> {
+    // Create a note — content is encrypted locally, server never sees plaintext
+    let result = create("my secret value", CreateOptions {
+        api_key: "vn_...".into(),
+        max_views: Some(1),   // destroy after this many reads (1–100)
+        expires_in: Some(1),  // hours until expiry (1–720)
+        ..Default::default()
+    }).await?;
+
+    println!("{}", result.url);    // https://voidnote.net/n/<tokenId>#<secret>
+    println!("{}", result.expires_at);
+    Ok(())
+}
 ```
 
-### Create a note
+---
+
+## API
+
+### `async fn create(content, opts) → Result<CreateResult>`
+
+Encrypt content locally and store the ciphertext. Requires an API key from your [dashboard](https://voidnote.net/dashboard).
 
 ```rust
 use voidnote::{create, CreateOptions};
 
-let note = create(
-    "launch codes: 4-8-15-16-23-42",
-    CreateOptions {
-        api_key: "vn_...".into(),
-        max_views: Some(1),
-        ..Default::default()
-    },
-)
-.await?;
+let result = create("deploy key: abc123", CreateOptions {
+    api_key: "vn_...".into(),
+    max_views: Some(3),
+    expires_in: Some(6),  // 6 hours
+    ..Default::default()
+}).await?;
 
-println!("share: {}", note.url);
-println!("expires: {}", note.expires_at);
+println!("{}", result.url);        // full shareable URL — includes #secret
+println!("{}", result.expires_at);
 ```
 
-### Live encrypted stream
+### `async fn read(url_or_token) → Result<ReadResult>`
+
+Fetch and decrypt a note. Consumes one view. Accepts both v1 URLs (`/n/<token>#<secret>`) and legacy URLs.
+
+```rust
+use voidnote::read;
+
+let note = read("https://voidnote.net/n/<tokenId>#<secret>").await?;
+println!("{}", note.content);
+println!("destroyed: {}", note.destroyed);
+```
+
+### `async fn peek(url_or_token) → Result<PeekResult>`
+
+Check metadata without consuming a view.
+
+```rust
+use voidnote::peek;
+
+let meta = peek("https://voidnote.net/n/<tokenId>#<secret>").await?;
+println!("exists: {}", meta.exists);
+println!("views remaining: {}", meta.views_remaining);
+println!("expires: {}", meta.expires_at);
+```
+
+### Void Streams
+
+Live encrypted real-time channels. Messages are encrypted before leaving your machine.
 
 ```rust
 use voidnote::{create_stream, StreamOptions};
 use futures::StreamExt;
 
-let mut stream = create_stream(StreamOptions {
+// Create a channel
+let stream = create_stream(StreamOptions {
     api_key: "vn_...".into(),
     title: Some("Deploy log".into()),
     ..Default::default()
-})
-.await?;
+}).await?;
 
 println!("share: {}", stream.url);
 
+// Write messages
 stream.write("Starting deployment...").await?;
 stream.write("Build complete.").await?;
-stream.write("Service is live.").await?;
-stream.close().await?;
-```
+stream.close().await?;  // self-destructs all content
 
-### Watch a stream (SSE)
-
-```rust
-use futures::StreamExt;
-
+// Watch a stream — yields decrypted messages
 let mut events = stream.watch();
 while let Some(msg) = events.next().await {
-    match msg {
-        Ok(text) => println!("{text}"),
-        Err(e) => eprintln!("error: {e}"),
-    }
+    println!("{}", msg?);
 }
 ```
 
@@ -93,100 +120,20 @@ while let Some(msg) = events.next().await {
 
 ## Blocking API
 
-For use in synchronous contexts (scripts, CLI tools, non-async code):
+For synchronous contexts (scripts, CLI tools):
 
 ```rust
 use voidnote::blocking;
 
-let note = blocking::read("https://voidnote.net/note/<token>")?;
+let note = blocking::read("https://voidnote.net/n/<tokenId>#<secret>")?;
 println!("{}", note.content);
 
-let created = blocking::create(
-    "my secret",
-    voidnote::CreateOptions {
-        api_key: "vn_...".into(),
-        ..Default::default()
-    },
-)?;
-println!("{}", created.url);
+let result = blocking::create("my secret", voidnote::CreateOptions {
+    api_key: "vn_...".into(),
+    ..Default::default()
+})?;
+println!("{}", result.url);
 ```
-
----
-
-## API reference
-
-### `async fn read(url_or_token: &str) -> Result<ReadResult>`
-
-Reads a note. Accepts either a full URL (`https://voidnote.net/note/<token>`) or a raw 64-character hex token.
-
-**`ReadResult`**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `content` | `String` | Decrypted plaintext |
-| `title` | `Option<String>` | Note title if set |
-| `view_count` | `u32` | How many times read |
-| `max_views` | `u32` | Destruction threshold |
-| `destroyed` | `bool` | Whether the note is gone |
-
----
-
-### `async fn create(content: &str, opts: CreateOptions) -> Result<CreateResult>`
-
-Creates a self-destructing encrypted note.
-
-**`CreateOptions`**
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `api_key` | `String` | required | Your VoidNote API key |
-| `title` | `Option<String>` | `None` | Optional title (stored encrypted) |
-| `max_views` | `Option<u32>` | `None` | Destroy after N reads |
-| `ttl_minutes` | `Option<u32>` | `None` | Expire after N minutes |
-
-**`CreateResult`**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `url` | `String` | Shareable URL (contains key in fragment) |
-| `expires_at` | `String` | ISO 8601 expiry timestamp |
-
----
-
-### `async fn create_stream(opts: StreamOptions) -> Result<StreamHandle>`
-
-Opens a live encrypted stream. Returns a handle for writing.
-
-**`StreamOptions`**
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `api_key` | `String` | required | Your VoidNote API key |
-| `title` | `Option<String>` | `None` | Stream title |
-| `max_views` | `Option<u32>` | `None` | Limit concurrent watchers |
-| `ttl_minutes` | `Option<u32>` | `None` | Auto-close after N minutes |
-
-**`StreamHandle`**
-
-| Method | Description |
-|--------|-------------|
-| `.url` | Shareable URL for the stream |
-| `async fn write(&mut self, msg: &str)` | Encrypt and send a message |
-| `async fn close(&mut self)` | Close the stream |
-| `fn watch(&self) -> impl Stream<Item = Result<String>>` | Subscribe to live messages (SSE) |
-
----
-
-## Security model
-
-VoidNote uses **zero-knowledge encryption** — the server never sees your plaintext.
-
-1. A random 32-byte token is generated client-side
-2. The first 16 bytes become the `tokenId` (sent to the server as a lookup key)
-3. The last 16 bytes become the `secret` — used to derive an AES-256-GCM key via SHA-256
-4. Content is encrypted locally before upload
-5. The full 64-character hex token is embedded in the URL **fragment** (`#token`) — fragments are never sent to servers
-6. Anyone with the link can decrypt; without the link, the server cannot
 
 ---
 
@@ -195,7 +142,7 @@ VoidNote uses **zero-knowledge encryption** — the server never sees your plain
 ```rust
 use voidnote::{Error, read};
 
-match read(token).await {
+match read(url).await {
     Ok(note) => println!("{}", note.content),
     Err(Error::NotFound) => eprintln!("note not found or already destroyed"),
     Err(Error::Unauthorized) => eprintln!("invalid API key"),
@@ -203,8 +150,6 @@ match read(token).await {
     Err(e) => eprintln!("error: {e}"),
 }
 ```
-
-**`Error` variants**
 
 | Variant | Meaning |
 |---------|---------|
@@ -218,24 +163,28 @@ match read(token).await {
 
 ---
 
-## Run the demo
+## Security model
 
-```sh
-git clone https://github.com/quantum-encoding/voidnote-rust
-cd voidnote-rust
-
-# Read a note
-cargo run --example demo -- read <url-or-token>
-
-# Create a note
-cargo run --example demo -- create "my secret" vn_...
-
-# Open a stream
-cargo run --example demo -- stream vn_...
 ```
+server generates  tokenId  (32-char hex — stored as lookup key)
+client generates  secret   (32-char hex — NEVER sent to server)
+
+key        = SHA-256(hex_decode(secret))
+ciphertext = AES-256-GCM(plaintext, key, random_12_byte_iv)
+share URL  = https://voidnote.net/n/{tokenId}#{secret}
+```
+
+The `#fragment` is never transmitted to HTTP servers per spec. The server has ciphertext; you have the key.
 
 ---
 
 ## License
 
 MIT
+
+## Links
+
+- [voidnote.net](https://voidnote.net)
+- [API reference](https://voidnote.net/docs)
+- [CLI reference](https://voidnote.net/cli)
+- [GitHub](https://github.com/quantum-encoding/voidnote-rs)
