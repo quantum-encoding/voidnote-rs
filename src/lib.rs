@@ -197,7 +197,30 @@ fn parse_note_url(input: &str) -> Result<ParsedUrl> {
 
 /// Fetch encrypted blob via v1 API and decrypt client-side (true zero-knowledge).
 async fn read_v1(token_id: &str, secret: &str, base: &str) -> Result<ReadResult> {
-    let url = format!("{base}/api/v1/note/{token_id}/consume");
+    // The view limit comes from metadata (reading it consumes nothing); the consume
+    // response only reports how many views remain.
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct MetaResponse {
+        exists: bool,
+        #[serde(rename = "viewLimit")]
+        view_limit: u32,
+    }
+    let meta_resp = reqwest::get(format!("{base}/api/v1/note/{token_id}/meta/")).await?;
+    let meta_status = meta_resp.status().as_u16();
+    let meta_body = meta_resp.text().await?;
+    if meta_status != 200 {
+        return Err(Error::Http { status: meta_status, body: meta_body });
+    }
+    let meta: MetaResponse = serde_json::from_str(&meta_body).unwrap_or_default();
+    if !meta.exists {
+        return Err(Error::Http {
+            status: 404,
+            body: "note not found or already destroyed".into(),
+        });
+    }
+
+    let url = format!("{base}/api/v1/note/{token_id}/consume/");
     let resp = reqwest::get(&url).await?;
     let status = resp.status().as_u16();
     let body = resp.text().await?;
@@ -216,7 +239,7 @@ async fn read_v1(token_id: &str, secret: &str, base: &str) -> Result<ReadResult>
     struct ConsumeResponse {
         encrypted: String,
         iv: String,
-        #[serde(default)]
+        #[serde(rename = "viewsRemaining", default)]
         views_remaining: u32,
         #[serde(default)]
         destroyed: bool,
@@ -228,15 +251,15 @@ async fn read_v1(token_id: &str, secret: &str, base: &str) -> Result<ReadResult>
     Ok(ReadResult {
         content,
         title: None,
-        view_count: 1,
-        max_views: raw.views_remaining + 1,
+        view_count: meta.view_limit.saturating_sub(raw.views_remaining),
+        max_views: meta.view_limit,
         destroyed: raw.destroyed,
     })
 }
 
 /// Fetch and decrypt via legacy server-decrypt endpoint (backward compat).
 async fn read_legacy(full_token: &str, base: &str) -> Result<ReadResult> {
-    let url = format!("{base}/api/note/{full_token}");
+    let url = format!("{base}/api/note/{full_token}/");
     let resp = reqwest::get(&url).await?;
     let status = resp.status().as_u16();
     let body = resp.text().await?;
@@ -308,7 +331,7 @@ pub async fn create(content: &str, opts: CreateOptions) -> Result<CreateResult> 
 
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("{base}/api/v1/note"))
+        .post(format!("{base}/api/v1/note/"))
         .bearer_auth(&opts.api_key)
         .json(&payload)
         .send()
@@ -354,7 +377,7 @@ pub async fn peek(url_or_token: &str, base: Option<&str>) -> Result<PeekResult> 
         last_seg
     };
 
-    let resp = reqwest::get(format!("{api_base}/api/v1/note/{token_id}/meta")).await?;
+    let resp = reqwest::get(format!("{api_base}/api/v1/note/{token_id}/meta/")).await?;
     let status = resp.status().as_u16();
     let body = resp.text().await?;
 
@@ -410,7 +433,7 @@ pub async fn create_stream(opts: StreamOptions) -> Result<StreamHandle> {
 
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("{base}/api/stream"))
+        .post(format!("{base}/api/stream/"))
         .bearer_auth(&opts.api_key)
         .json(&payload)
         .send()
@@ -445,8 +468,40 @@ pub async fn create_stream(opts: StreamOptions) -> Result<StreamHandle> {
         secret,
         key,
         base,
+        api_key: opts.api_key,
         client: reqwest::Client::new(),
     })
+}
+
+/// Join a stream and return its short-lived SSE access token (`?at=`).
+async fn join_stream(
+    client: &reqwest::Client,
+    base: &str,
+    full_token: &str,
+    password: Option<&str>,
+) -> Result<String> {
+    let body = match password {
+        Some(p) => serde_json::json!({ "password": p }),
+        None => serde_json::json!({}),
+    };
+    let resp = client
+        .post(format!("{base}/api/stream/{full_token}/join/"))
+        .json(&body)
+        .send()
+        .await?;
+    let status = resp.status().as_u16();
+    let text = resp.text().await?;
+    if !(200..300).contains(&status) {
+        return Err(Error::Http { status, body: text });
+    }
+
+    #[derive(Deserialize)]
+    struct JoinResponse {
+        #[serde(rename = "accessToken")]
+        access_token: String,
+    }
+    let parsed: JoinResponse = serde_json::from_str(&text)?;
+    Ok(parsed.access_token)
 }
 
 // ── StreamHandle ──────────────────────────────────────────────────────────────
@@ -463,6 +518,7 @@ pub mod stream {
         pub(crate) secret: String,
         pub(crate) key: [u8; 32], // pre-derived AES key
         pub(crate) base: String,
+        pub(crate) api_key: String, // the creator's key — broadcast write/close require it
         pub(crate) client: reqwest::Client,
     }
 
@@ -481,9 +537,10 @@ pub mod stream {
             let resp = self
                 .client
                 .post(format!(
-                    "{}/api/stream/{}/write",
+                    "{}/api/stream/{}/write/",
                     self.base, self.full_token
                 ))
+                .bearer_auth(&self.api_key)
                 .json(&WriteBody {
                     encrypted_content: &enc_hex,
                     iv: &iv_hex,
@@ -504,9 +561,10 @@ pub mod stream {
             let resp = self
                 .client
                 .post(format!(
-                    "{}/api/stream/{}/close",
+                    "{}/api/stream/{}/close/",
                     self.base, self.full_token
                 ))
+                .bearer_auth(&self.api_key)
                 .json(&serde_json::json!({}))
                 .send()
                 .await?;
@@ -521,8 +579,10 @@ pub mod stream {
 
         /// Watch the stream as an async [`Stream`] of decrypted messages.
         ///
-        /// Automatically reconnects using SSE `Last-Event-ID` until the stream
-        /// closes or expires.
+        /// Joins the stream for a short-lived access token, then reconnects using
+        /// SSE `Last-Event-ID` (re-joining when the token expires) until the stream
+        /// closes or expires. Use [`watch_with_password`](Self::watch_with_password)
+        /// for password-protected streams.
         ///
         /// ```rust,ignore
         /// use futures::StreamExt;
@@ -533,6 +593,21 @@ pub mod stream {
         /// }
         /// ```
         pub fn watch(&self) -> impl Stream<Item = Result<String>> + Send + 'static {
+            self.watch_inner(None)
+        }
+
+        /// [`watch`](Self::watch) for a password-protected stream.
+        pub fn watch_with_password(
+            &self,
+            password: &str,
+        ) -> impl Stream<Item = Result<String>> + Send + 'static {
+            self.watch_inner(Some(password.to_owned()))
+        }
+
+        fn watch_inner(
+            &self,
+            password: Option<String>,
+        ) -> impl Stream<Item = Result<String>> + Send + 'static {
             let base = self.base.clone();
             let full_token = self.full_token.clone();
             let key = self.key;
@@ -540,10 +615,28 @@ pub mod stream {
 
             async_stream::stream! {
                 let mut last_id: Option<String> = None;
+                let mut access_token: Option<String> = None;
+                // A token rejected straight after a fresh join is a real failure, not expiry.
+                let mut fresh_token = false;
 
                 'outer: loop {
+                    if access_token.is_none() {
+                        match join_stream(&client, &base, &full_token, password.as_deref()).await {
+                            Ok(at) => {
+                                access_token = Some(at);
+                                fresh_token = true;
+                            }
+                            Err(e) => {
+                                yield Err(e);
+                                return;
+                            }
+                        }
+                    }
+                    let at = access_token.clone().unwrap_or_default();
+
                     let mut req = client
-                        .get(format!("{base}/api/stream/{full_token}/events"));
+                        .get(format!("{base}/api/stream/{full_token}/events/"))
+                        .query(&[("at", at.as_str())]);
 
                     if let Some(ref id) = last_id {
                         req = req.header("Last-Event-ID", id);
@@ -557,13 +650,22 @@ pub mod stream {
                         }
                     };
 
-                    if !resp.status().is_success() {
-                        yield Err(Error::Http {
-                            status: resp.status().as_u16(),
-                            body: resp.text().await.unwrap_or_default(),
-                        });
-                        return;
+                    match resp.status().as_u16() {
+                        410 => return, // closed or expired
+                        401 if !fresh_token => {
+                            access_token = None; // expired — join again
+                            continue 'outer;
+                        }
+                        s if !(200..300).contains(&s) => {
+                            yield Err(Error::Http {
+                                status: s,
+                                body: resp.text().await.unwrap_or_default(),
+                            });
+                            return;
+                        }
+                        _ => {}
                     }
+                    fresh_token = false;
 
                     use futures::StreamExt as _;
                     let mut byte_stream = resp.bytes_stream();
@@ -634,7 +736,8 @@ pub mod stream {
                             }
                         }
                     }
-                    // Connection dropped — reconnect (continue outer loop)
+                    // Connection dropped — reconnect after a short pause (continue outer loop)
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     continue 'outer;
                 }
             }
@@ -732,7 +835,7 @@ pub async fn create_crypto_order(opts: CryptoOrderOptions) -> Result<CryptoOrder
 
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("{base}/api/buy/crypto/create-order"))
+        .post(format!("{base}/api/buy/crypto/create-order/"))
         .bearer_auth(&opts.api_key)
         .json(&payload)
         .send()
@@ -773,7 +876,7 @@ pub async fn submit_crypto_payment(opts: SubmitPaymentOptions) -> Result<SubmitP
 
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("{base}/api/buy/crypto/submit-tx"))
+        .post(format!("{base}/api/buy/crypto/submit-tx/"))
         .bearer_auth(&opts.api_key)
         .json(&payload)
         .send()
