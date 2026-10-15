@@ -6,21 +6,28 @@
 //! ## Quick start
 //!
 //! ```rust,no_run
-//! use voidnote::{read, create, CreateOptions};
+//! use voidnote::{read, read_with, create, CreateOptions, ReadOptions};
 //!
 //! #[tokio::main]
 //! async fn main() -> voidnote::Result<()> {
-//!     // Create a note
-//!     let note = create("my secret message", CreateOptions {
-//!         api_key: "vn_...".into(),
-//!         max_views: Some(1),
-//!         ..Default::default()
-//!     }).await?;
+//!     // Create a note — no account or API key needed
+//!     let note = create("my secret message", CreateOptions::default()).await?;
 //!     println!("share: {}", note.url);
 //!
 //!     // Read it back
 //!     let result = read(&note.url).await?;
 //!     println!("{}", result.content);
+//!
+//!     // A note that also needs a password
+//!     let guarded = create("launch codes", CreateOptions {
+//!         password: Some("correct horse".into()),
+//!         ..Default::default()
+//!     }).await?;
+//!     let opened = read_with(&guarded.url, ReadOptions {
+//!         password: Some("correct horse".into()),
+//!         ..Default::default()
+//!     }).await?;
+//!     println!("{}", opened.content);
 //!     Ok(())
 //! }
 //! ```
@@ -42,6 +49,13 @@ pub use self::stream::StreamHandle;
 
 const DEFAULT_BASE: &str = "https://voidnote.net";
 
+/// Note key derivation: key = SHA-256(secret bytes).
+pub const KDF_SHA256: &str = "sha256";
+/// Note key derivation: key = PBKDF2-HMAC-SHA256(password UTF-8, salt = secret bytes, 600000 iterations).
+pub const KDF_PBKDF2: &str = "pbkdf2-sha256-600k";
+/// PBKDF2 iteration count for [`KDF_PBKDF2`].
+pub const PBKDF2_ITERATIONS: u32 = 600_000;
+
 // ── Error ─────────────────────────────────────────────────────────────────────
 
 /// All errors this SDK can produce.
@@ -51,13 +65,27 @@ pub enum Error {
     InvalidToken,
     /// An API key was required but not provided
     MissingApiKey,
+    /// The note does not exist, expired, or its views are used up
+    NotFound,
+    /// The note was created with a password and none was given. No view was used.
+    PasswordRequired,
+    /// The note uses a key derivation this SDK version cannot do. No view was used.
+    UnsupportedKdf(String),
+    /// An empty password was given to [`create`]
+    EmptyPassword,
     /// HTTP transport error (DNS, TLS, timeout)
     Network(reqwest::Error),
-    /// Server returned a non-2xx status code
-    Http { status: u16, body: String },
+    /// Server returned a non-2xx status code with its error message
+    Http {
+        status: u16,
+        message: String,
+        /// Seconds the server asked to wait (Retry-After), when it sent one
+        retry_after: Option<u64>,
+    },
     /// Response JSON could not be parsed
     Json(serde_json::Error),
-    /// AES-GCM authentication failed (wrong key or tampered data)
+    /// AES-GCM authentication failed: wrong password, wrong key or tampered data.
+    /// For a note read with [`read_with`], the view was used.
     DecryptionFailed,
     /// Hex string is invalid
     InvalidHex(hex::FromHexError),
@@ -68,10 +96,27 @@ impl fmt::Display for Error {
         match self {
             Error::InvalidToken => write!(f, "invalid token: expected 64-char hex string"),
             Error::MissingApiKey => write!(f, "api_key is required"),
+            Error::NotFound => write!(f, "note not found, expired or already destroyed"),
+            Error::PasswordRequired => {
+                write!(f, "this note needs a password — use read_with (no view was used)")
+            }
+            Error::UnsupportedKdf(kdf) => write!(
+                f,
+                "this note uses key derivation \"{kdf}\", which this SDK version cannot decrypt — upgrade voidnote"
+            ),
+            Error::EmptyPassword => write!(f, "password must not be empty"),
             Error::Network(e) => write!(f, "network error: {e}"),
-            Error::Http { status, body } => write!(f, "HTTP {status}: {body}"),
+            Error::Http { status, message, retry_after } => {
+                write!(f, "HTTP {status}: {message}")?;
+                if let Some(secs) = retry_after {
+                    write!(f, " (retry after {secs}s)")?;
+                }
+                Ok(())
+            }
             Error::Json(e) => write!(f, "JSON parse error: {e}"),
-            Error::DecryptionFailed => write!(f, "decryption failed: wrong key or tampered data"),
+            Error::DecryptionFailed => {
+                write!(f, "decryption failed: wrong password, wrong key or tampered data")
+            }
             Error::InvalidHex(e) => write!(f, "invalid hex: {e}"),
         }
     }
@@ -100,6 +145,41 @@ impl From<hex::FromHexError> for Error {
 /// SDK result type.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Retry-After as seconds (delta-seconds form; the server sends no HTTP dates).
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// [`Error::Http`] from a status, Retry-After and body; the message is the body's
+/// `error` field when it is JSON, else the body text.
+fn http_error(status: u16, retry_after: Option<u64>, body: &str) -> Error {
+    #[derive(Deserialize)]
+    struct ErrorBody {
+        error: String,
+    }
+    let message = serde_json::from_str::<ErrorBody>(body)
+        .map(|b| b.error)
+        .unwrap_or_else(|_| body.trim().chars().take(300).collect());
+    Error::Http { status, message, retry_after }
+}
+
+/// Body text of a 2xx response; any other status becomes [`Error::Http`].
+async fn success_text(resp: reqwest::Response) -> Result<String> {
+    let status = resp.status().as_u16();
+    let wait = retry_after(resp.headers());
+    let body = resp.text().await?;
+    if !(200..300).contains(&status) {
+        return Err(http_error(status, wait, &body));
+    }
+    Ok(body)
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /// Decrypted contents of a VoidNote.
@@ -111,20 +191,21 @@ pub struct ReadResult {
     pub max_views: u32,
     /// True if the note was destroyed after this read (view limit reached).
     pub destroyed: bool,
+    /// Key derivation of a v1 note ([`KDF_SHA256`] or [`KDF_PBKDF2`]); empty for legacy notes.
+    pub kdf: String,
 }
 
 /// Options for creating a note.
 #[derive(Debug, Clone, Default)]
 pub struct CreateOptions {
-    /// Required: vn_... API key from your dashboard
-    pub api_key: String,
-    pub title: Option<String>,
-    /// 1–100; defaults to 1
+    /// Optional vn_... API key from a free account. `None` creates an anonymous note.
+    pub api_key: Option<String>,
+    /// Optional password the reader must also supply ([`KDF_PBKDF2`]).
+    pub password: Option<String>,
+    /// Views before the note is destroyed; defaults to 1. Up to 10 anonymous, 100 with an API key.
     pub max_views: Option<u8>,
-    /// Hours until expiry. Valid values: 1, 6, 24, 72, 168, 720. Defaults to 24.
+    /// Hours until expiry; defaults to 1. Up to 168 anonymous, 720 with an API key.
     pub expires_in: Option<u16>,
-    /// Note type: "secure" (default, confirm to reveal) or "pipe" (auto-reveal for scripts).
-    pub note_type: Option<String>,
     /// Override the API base URL (default: https://voidnote.net)
     pub base: Option<String>,
 }
@@ -134,13 +215,26 @@ pub struct CreateOptions {
 pub struct CreateResult {
     /// Full shareable URL (contains the decryption key)
     pub url: String,
+    /// 32-char tokenId
+    pub token: String,
     pub expires_at: String,
+    pub view_limit: u32,
+    pub kdf: String,
+}
+
+/// Options for [`read_with`].
+#[derive(Debug, Clone, Default)]
+pub struct ReadOptions {
+    /// The sender's password, for notes created with one. Ignored for notes without one.
+    pub password: Option<String>,
+    /// Override the API base URL (default: https://voidnote.net)
+    pub base: Option<String>,
 }
 
 /// Options for creating a Void Stream.
 #[derive(Debug, Clone, Default)]
 pub struct StreamOptions {
-    /// Required: vn_... API key from your dashboard
+    /// Required: vn_... API key from a free account
     pub api_key: String,
     pub title: Option<String>,
     /// TTL in seconds: 3600 (1h), 21600 (6h), or 86400 (24h). Defaults to 3600.
@@ -151,20 +245,33 @@ pub struct StreamOptions {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Read and decrypt a VoidNote.
+/// Read and decrypt a VoidNote. Consumes one view.
 ///
-/// `url_or_token` may be a full URL (`https://voidnote.net/note/<token>`)
-/// or a raw 64-char hex token.
+/// `url_or_token` may be a v1 URL (`https://voidnote.net/n/<tokenId>#<secret>`),
+/// a legacy URL (`https://voidnote.net/note/<token>`) or a raw 64-char hex token.
+/// Notes created with a password need [`read_with`].
 pub async fn read(url_or_token: &str) -> Result<ReadResult> {
-    read_from(url_or_token, DEFAULT_BASE).await
+    read_with(url_or_token, ReadOptions::default()).await
 }
 
 /// Like [`read`] but allows overriding the API base URL.
 pub async fn read_from(url_or_token: &str, base: &str) -> Result<ReadResult> {
-    let parsed = parse_note_url(url_or_token)?;
+    read_with(url_or_token, ReadOptions { password: None, base: Some(base.into()) }).await
+}
 
-    match parsed {
-        ParsedUrl::V1 { token_id, secret } => read_v1(&token_id, &secret, base).await,
+/// Like [`read`], with a password for notes created with one.
+///
+/// v1 notes are checked first without using a view: a missing note returns
+/// [`Error::NotFound`], a note that needs a password when none was given returns
+/// [`Error::PasswordRequired`], and an unknown key derivation returns
+/// [`Error::UnsupportedKdf`], all with the view unused. A wrong password
+/// ([`Error::DecryptionFailed`]) is only detectable after the view is used.
+pub async fn read_with(url_or_token: &str, opts: ReadOptions) -> Result<ReadResult> {
+    let base = opts.base.as_deref().unwrap_or(DEFAULT_BASE);
+    match parse_note_url(url_or_token)? {
+        ParsedUrl::V1 { token_id, secret } => {
+            read_v1(&token_id, &secret, base, opts.password.as_deref()).await
+        }
         ParsedUrl::Legacy { full_token } => read_legacy(&full_token, base).await,
     }
 }
@@ -195,44 +302,36 @@ fn parse_note_url(input: &str) -> Result<ParsedUrl> {
     Ok(ParsedUrl::Legacy { full_token: token })
 }
 
+/// Maps an absent kdf to [`KDF_SHA256`] and rejects ones this SDK cannot derive.
+fn check_kdf(kdf: &str) -> Result<&'static str> {
+    match kdf {
+        "" | KDF_SHA256 => Ok(KDF_SHA256),
+        KDF_PBKDF2 => Ok(KDF_PBKDF2),
+        other => Err(Error::UnsupportedKdf(other.to_owned())),
+    }
+}
+
 /// Fetch encrypted blob via v1 API and decrypt client-side (true zero-knowledge).
-async fn read_v1(token_id: &str, secret: &str, base: &str) -> Result<ReadResult> {
-    // The view limit comes from metadata (reading it consumes nothing); the consume
-    // response only reports how many views remain.
+async fn read_v1(token_id: &str, secret: &str, base: &str, password: Option<&str>) -> Result<ReadResult> {
+    // Metadata costs no view: it gives the view limit (the consume response only
+    // reports how many views remain) and the kdf, checked before the view is used.
     #[derive(Deserialize, Default)]
     #[serde(default)]
     struct MetaResponse {
         exists: bool,
         #[serde(rename = "viewLimit")]
         view_limit: u32,
+        kdf: String,
     }
-    let meta_resp = reqwest::get(format!("{base}/api/v1/note/{token_id}/meta/")).await?;
-    let meta_status = meta_resp.status().as_u16();
-    let meta_body = meta_resp.text().await?;
-    if meta_status != 200 {
-        return Err(Error::Http { status: meta_status, body: meta_body });
-    }
-    let meta: MetaResponse = serde_json::from_str(&meta_body).unwrap_or_default();
+    let meta_body = success_text(reqwest::get(format!("{base}/api/v1/note/{token_id}/meta/")).await?).await?;
+    let meta: MetaResponse = serde_json::from_str(&meta_body)?;
     if !meta.exists {
-        return Err(Error::Http {
-            status: 404,
-            body: "note not found or already destroyed".into(),
-        });
+        return Err(Error::NotFound);
     }
-
-    let url = format!("{base}/api/v1/note/{token_id}/consume/");
-    let resp = reqwest::get(&url).await?;
-    let status = resp.status().as_u16();
-    let body = resp.text().await?;
-
-    if status == 410 || status == 404 {
-        return Err(Error::Http {
-            status,
-            body: "note not found or already destroyed".into(),
-        });
-    }
-    if status != 200 {
-        return Err(Error::Http { status, body });
+    let meta_kdf = check_kdf(&meta.kdf)?;
+    let password = password.filter(|p| !p.is_empty());
+    if meta_kdf != KDF_SHA256 && password.is_none() {
+        return Err(Error::PasswordRequired);
     }
 
     #[derive(Deserialize)]
@@ -243,10 +342,15 @@ async fn read_v1(token_id: &str, secret: &str, base: &str) -> Result<ReadResult>
         views_remaining: u32,
         #[serde(default)]
         destroyed: bool,
+        #[serde(default)]
+        kdf: String,
     }
 
+    let body = success_text(reqwest::get(format!("{base}/api/v1/note/{token_id}/consume/")).await?).await?;
     let raw: ConsumeResponse = serde_json::from_str(&body)?;
-    let content = decrypt_content(&raw.encrypted, &raw.iv, secret)?;
+    let kdf = if raw.kdf.is_empty() { meta_kdf } else { check_kdf(&raw.kdf)? };
+    let key = derive_note_key(secret, kdf, password)?;
+    let content = decrypt_with_key(&raw.encrypted, &raw.iv, &key)?;
 
     Ok(ReadResult {
         content,
@@ -254,25 +358,13 @@ async fn read_v1(token_id: &str, secret: &str, base: &str) -> Result<ReadResult>
         view_count: meta.view_limit.saturating_sub(raw.views_remaining),
         max_views: meta.view_limit,
         destroyed: raw.destroyed,
+        kdf: kdf.to_owned(),
     })
 }
 
 /// Fetch and decrypt via legacy server-decrypt endpoint (backward compat).
 async fn read_legacy(full_token: &str, base: &str) -> Result<ReadResult> {
-    let url = format!("{base}/api/note/{full_token}/");
-    let resp = reqwest::get(&url).await?;
-    let status = resp.status().as_u16();
-    let body = resp.text().await?;
-
-    if status == 404 || status == 410 {
-        return Err(Error::Http {
-            status,
-            body: "note not found or already destroyed".into(),
-        });
-    }
-    if status != 200 {
-        return Err(Error::Http { status, body });
-    }
+    let body = success_text(reqwest::get(format!("{base}/api/note/{full_token}/")).await?).await?;
 
     #[derive(Deserialize)]
     struct LegacyResponse {
@@ -293,6 +385,7 @@ async fn read_legacy(full_token: &str, base: &str) -> Result<ReadResult> {
         view_count: raw.view_count,
         max_views: raw.max_views,
         destroyed: raw.destroyed,
+        kdf: String::new(),
     })
 }
 
@@ -300,15 +393,23 @@ async fn read_legacy(full_token: &str, base: &str) -> Result<ReadResult> {
 /// The server generates the tokenId; the client holds the secret in the URL fragment.
 /// The server never sees the plaintext or the secret.
 /// Returns a URL in the form https://voidnote.net/n/{tokenId}#{secret}.
+///
+/// No API key is needed: without one the note is anonymous, held to 168 hours and
+/// 10 views, and rate-limited per IP. With a password the key is derived with
+/// PBKDF2 and the reader needs both the link and the password. Server refusals
+/// come back as [`Error::Http`] with the server's message and Retry-After.
 pub async fn create(content: &str, opts: CreateOptions) -> Result<CreateResult> {
-    if opts.api_key.is_empty() {
-        return Err(Error::MissingApiKey);
-    }
     let base = opts.base.as_deref().unwrap_or(DEFAULT_BASE);
+    let password = match opts.password.as_deref() {
+        Some("") => return Err(Error::EmptyPassword),
+        p => p,
+    };
+    let kdf = if password.is_some() { KDF_PBKDF2 } else { KDF_SHA256 };
 
     // Generate only the secret (16 bytes) — server generates tokenId
     let secret = generate_secret();
-    let (enc_hex, iv_hex) = encrypt_content(content, &secret)?;
+    let key = derive_note_key(&secret, kdf, password)?;
+    let (enc_hex, iv_hex) = encrypt_with_key(content, &key)?;
 
     let max_views = opts.max_views.unwrap_or(1);
     let expires_in_secs = opts.expires_in.unwrap_or(1) as u32 * 3600; // hours → seconds
@@ -320,6 +421,7 @@ pub async fn create(content: &str, opts: CreateOptions) -> Result<CreateResult> 
         iv: &'a str,
         expires_in: u32,
         view_limit: u8,
+        kdf: &'a str,
     }
 
     let payload = CreateBody {
@@ -327,22 +429,15 @@ pub async fn create(content: &str, opts: CreateOptions) -> Result<CreateResult> 
         iv: &iv_hex,
         expires_in: expires_in_secs,
         view_limit: max_views,
+        kdf,
     };
 
     let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{base}/api/v1/note/"))
-        .bearer_auth(&opts.api_key)
-        .json(&payload)
-        .send()
-        .await?;
-
-    let status = resp.status().as_u16();
-    let body = resp.text().await?;
-
-    if status != 200 && status != 201 {
-        return Err(Error::Http { status, body });
+    let mut req = client.post(format!("{base}/api/v1/note/")).json(&payload);
+    if let Some(api_key) = opts.api_key.as_deref().filter(|k| !k.is_empty()) {
+        req = req.bearer_auth(api_key);
     }
+    let body = success_text(req.send().await?).await?;
 
     #[derive(Deserialize, Default)]
     #[serde(default)]
@@ -351,19 +446,27 @@ pub async fn create(content: &str, opts: CreateOptions) -> Result<CreateResult> 
         url: Option<String>,
         #[serde(rename = "expiresAt")]
         expires_at: Option<String>,
+        #[serde(rename = "viewLimit")]
+        view_limit: Option<u32>,
+        kdf: Option<String>,
     }
 
     let raw: CreateResponse = serde_json::from_str(&body).unwrap_or_default();
-    let base_url = raw.url.unwrap_or_else(|| format!("{base}/n/{}", raw.token.as_deref().unwrap_or("")));
+    let token = raw.token.unwrap_or_default();
+    let base_url = raw.url.unwrap_or_else(|| format!("{base}/n/{token}"));
 
     Ok(CreateResult {
         // Append #secret — this is the only place the secret and URL are combined
         url: format!("{base_url}#{secret}"),
+        token,
         expires_at: raw.expires_at.unwrap_or_default(),
+        view_limit: raw.view_limit.unwrap_or(max_views as u32),
+        kdf: raw.kdf.unwrap_or_else(|| kdf.to_owned()),
     })
 }
 
-/// Peek at note metadata without consuming a view.
+/// Peek at note metadata without consuming a view. [`PeekResult::kdf`] is
+/// [`KDF_PBKDF2`] when the note needs a password.
 /// Accepts v1 URLs (https://voidnote.net/n/{tokenId}#{secret}) or raw 32-char tokenIds.
 pub async fn peek(url_or_token: &str, base: Option<&str>) -> Result<PeekResult> {
     let api_base = base.unwrap_or(DEFAULT_BASE);
@@ -377,14 +480,7 @@ pub async fn peek(url_or_token: &str, base: Option<&str>) -> Result<PeekResult> 
         last_seg
     };
 
-    let resp = reqwest::get(format!("{api_base}/api/v1/note/{token_id}/meta/")).await?;
-    let status = resp.status().as_u16();
-    let body = resp.text().await?;
-
-    if status != 200 {
-        return Err(Error::Http { status, body });
-    }
-
+    let body = success_text(reqwest::get(format!("{api_base}/api/v1/note/{token_id}/meta/")).await?).await?;
     let raw: PeekResult = serde_json::from_str(&body)?;
     Ok(raw)
 }
@@ -403,9 +499,12 @@ pub struct PeekResult {
     pub view_limit: u32,
     #[serde(rename = "viewsRemaining", default)]
     pub views_remaining: u32,
+    /// [`KDF_SHA256`] or [`KDF_PBKDF2`]; empty when the note does not exist.
+    #[serde(default)]
+    pub kdf: String,
 }
 
-/// Create a new Void Stream. Requires an API key. Costs 1 credit.
+/// Create a new Void Stream. Requires an API key from a free account.
 ///
 /// Returns a [`StreamHandle`] with `.write()`, `.close()`, and `.watch()`.
 pub async fn create_stream(opts: StreamOptions) -> Result<StreamHandle> {
@@ -439,12 +538,7 @@ pub async fn create_stream(opts: StreamOptions) -> Result<StreamHandle> {
         .send()
         .await?;
 
-    let status = resp.status().as_u16();
-    let body = resp.text().await?;
-
-    if status != 200 && status != 201 {
-        return Err(Error::Http { status, body });
-    }
+    let body = success_text(resp).await?;
 
     #[derive(Deserialize, Default)]
     #[serde(default)]
@@ -489,11 +583,7 @@ async fn join_stream(
         .json(&body)
         .send()
         .await?;
-    let status = resp.status().as_u16();
-    let text = resp.text().await?;
-    if !(200..300).contains(&status) {
-        return Err(Error::Http { status, body: text });
-    }
+    let text = success_text(resp).await?;
 
     #[derive(Deserialize)]
     struct JoinResponse {
@@ -548,11 +638,7 @@ pub mod stream {
                 .send()
                 .await?;
 
-            if !resp.status().is_success() {
-                let status = resp.status().as_u16();
-                let body = resp.text().await.unwrap_or_default();
-                return Err(Error::Http { status, body });
-            }
+            success_text(resp).await?;
             Ok(())
         }
 
@@ -569,11 +655,7 @@ pub mod stream {
                 .send()
                 .await?;
 
-            if !resp.status().is_success() {
-                let status = resp.status().as_u16();
-                let body = resp.text().await.unwrap_or_default();
-                return Err(Error::Http { status, body });
-            }
+            success_text(resp).await?;
             Ok(())
         }
 
@@ -657,10 +739,9 @@ pub mod stream {
                             continue 'outer;
                         }
                         s if !(200..300).contains(&s) => {
-                            yield Err(Error::Http {
-                                status: s,
-                                body: resp.text().await.unwrap_or_default(),
-                            });
+                            let wait = retry_after(resp.headers());
+                            let body = resp.text().await.unwrap_or_default();
+                            yield Err(http_error(s, wait, &body));
                             return;
                         }
                         _ => {}
@@ -754,149 +835,10 @@ pub mod stream {
     }
 }
 
-// ── Buy / Credits API ─────────────────────────────────────────────────────────
-
-/// Options for creating a cryptocurrency payment order.
-#[derive(Debug, Clone)]
-pub struct CryptoOrderOptions {
-    /// Required: vn_... API key from your dashboard
-    pub api_key: String,
-    /// Number of credits to purchase
-    pub credits: u32,
-    /// Cryptocurrency ticker symbol (e.g. "BTC", "ETH", "LTC")
-    pub currency: String,
-    /// Override the API base URL (default: https://voidnote.net)
-    pub base: Option<String>,
-}
-
-/// A cryptocurrency payment order returned by the API.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CryptoOrder {
-    /// Unique order identifier
-    pub order_id: String,
-    /// Wallet address to send payment to
-    pub address: String,
-    /// Amount to send in the requested cryptocurrency
-    pub amount: String,
-    /// Cryptocurrency ticker (e.g. "BTC")
-    pub currency: String,
-    /// Number of credits that will be added on payment
-    pub credits: u32,
-    /// ISO 8601 timestamp when the order expires
-    pub expires_at: String,
-}
-
-/// Options for submitting a cryptocurrency transaction for an existing order.
-#[derive(Debug, Clone)]
-pub struct SubmitPaymentOptions {
-    /// Required: vn_... API key from your dashboard
-    pub api_key: String,
-    /// Order ID returned by [`create_crypto_order`]
-    pub order_id: String,
-    /// On-chain transaction hash / TXID
-    pub tx_hash: String,
-    /// Override the API base URL (default: https://voidnote.net)
-    pub base: Option<String>,
-}
-
-/// Result of submitting a cryptocurrency payment transaction.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SubmitPaymentResult {
-    /// Whether the submission was accepted
-    pub success: bool,
-    /// Human-readable status message
-    pub message: String,
-    /// Current status of the order (e.g. "pending", "confirming", "complete")
-    pub status: String,
-}
-
-/// Create a cryptocurrency payment order to purchase credits.
-///
-/// Returns a [`CryptoOrder`] containing the wallet address and exact amount to send.
-pub async fn create_crypto_order(opts: CryptoOrderOptions) -> Result<CryptoOrder> {
-    if opts.api_key.is_empty() {
-        return Err(Error::MissingApiKey);
-    }
-    let base = opts.base.as_deref().unwrap_or(DEFAULT_BASE);
-
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
-    struct OrderBody {
-        credits: u32,
-        currency: String,
-    }
-
-    let payload = OrderBody {
-        credits: opts.credits,
-        currency: opts.currency.clone(),
-    };
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{base}/api/buy/crypto/create-order/"))
-        .bearer_auth(&opts.api_key)
-        .json(&payload)
-        .send()
-        .await?;
-
-    let status = resp.status().as_u16();
-    let body = resp.text().await?;
-
-    if status != 200 && status != 201 {
-        return Err(Error::Http { status, body });
-    }
-
-    let order: CryptoOrder = serde_json::from_str(&body)?;
-    Ok(order)
-}
-
-/// Submit an on-chain transaction hash for an existing crypto payment order.
-///
-/// Call this after broadcasting your transaction. The API will monitor the
-/// blockchain and credit your account once the required confirmations are reached.
-pub async fn submit_crypto_payment(opts: SubmitPaymentOptions) -> Result<SubmitPaymentResult> {
-    if opts.api_key.is_empty() {
-        return Err(Error::MissingApiKey);
-    }
-    let base = opts.base.as_deref().unwrap_or(DEFAULT_BASE);
-
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
-    struct SubmitBody {
-        order_id: String,
-        tx_hash: String,
-    }
-
-    let payload = SubmitBody {
-        order_id: opts.order_id.clone(),
-        tx_hash: opts.tx_hash.clone(),
-    };
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{base}/api/buy/crypto/submit-tx/"))
-        .bearer_auth(&opts.api_key)
-        .json(&payload)
-        .send()
-        .await?;
-
-    let status = resp.status().as_u16();
-    let body = resp.text().await?;
-
-    if status != 200 && status != 201 {
-        return Err(Error::Http { status, body });
-    }
-
-    let result: SubmitPaymentResult = serde_json::from_str(&body)?;
-    Ok(result)
-}
-
 // ── Blocking wrappers ─────────────────────────────────────────────────────────
 
 /// Synchronous wrapper around the async API.
-/// Requires a Tokio runtime to be available (or use [`tokio::runtime::Runtime`]).
+/// Each call starts its own Tokio runtime, so do not call these from inside one.
 pub mod blocking {
     use super::*;
 
@@ -909,6 +851,16 @@ pub mod blocking {
         rt().block_on(super::read(url_or_token))
     }
 
+    /// Blocking version of [`read_with`].
+    pub fn read_with(url_or_token: &str, opts: ReadOptions) -> Result<ReadResult> {
+        rt().block_on(super::read_with(url_or_token, opts))
+    }
+
+    /// Blocking version of [`peek`].
+    pub fn peek(url_or_token: &str, base: Option<&str>) -> Result<PeekResult> {
+        rt().block_on(super::peek(url_or_token, base))
+    }
+
     /// Blocking version of [`create`].
     pub fn create(content: &str, opts: CreateOptions) -> Result<CreateResult> {
         rt().block_on(super::create(content, opts))
@@ -917,16 +869,6 @@ pub mod blocking {
     /// Blocking version of [`create_stream`].
     pub fn create_stream(opts: StreamOptions) -> Result<StreamHandle> {
         rt().block_on(super::create_stream(opts))
-    }
-
-    /// Blocking version of [`create_crypto_order`].
-    pub fn create_crypto_order(opts: CryptoOrderOptions) -> Result<CryptoOrder> {
-        rt().block_on(super::create_crypto_order(opts))
-    }
-
-    /// Blocking version of [`submit_crypto_payment`].
-    pub fn submit_crypto_payment(opts: SubmitPaymentOptions) -> Result<SubmitPaymentResult> {
-        rt().block_on(super::submit_crypto_payment(opts))
     }
 }
 
@@ -952,14 +894,30 @@ fn derive_key_bytes(secret_hex: &str) -> Result<[u8; 32]> {
     Ok(key)
 }
 
+/// Derive a note's AES key from its secret with the named kdf
+/// ([`KDF_SHA256`] or [`KDF_PBKDF2`]; the password is hashed as its UTF-8 bytes).
+fn derive_note_key(secret_hex: &str, kdf: &str, password: Option<&str>) -> Result<[u8; 32]> {
+    if kdf != KDF_PBKDF2 {
+        return derive_key_bytes(secret_hex);
+    }
+    let password = password.filter(|p| !p.is_empty()).ok_or(Error::PasswordRequired)?;
+    let salt = hex_decode(secret_hex)?;
+    let mut key = [0u8; 32];
+    pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, PBKDF2_ITERATIONS, &mut key);
+    Ok(key)
+}
+
+/// AES-256-GCM encrypt with the sha256-derived key (streams). Returns (ciphertext_hex, iv_hex).
+fn encrypt_content(plaintext: &str, secret_hex: &str) -> Result<(String, String)> {
+    encrypt_with_key(plaintext, &derive_key_bytes(secret_hex)?)
+}
+
 /// AES-256-GCM encrypt. Returns (ciphertext_hex, iv_hex).
 /// Output ciphertext is ciphertext || 16-byte tag (Go SDK compatible).
-fn encrypt_content(plaintext: &str, secret_hex: &str) -> Result<(String, String)> {
+fn encrypt_with_key(plaintext: &str, key_bytes: &[u8; 32]) -> Result<(String, String)> {
     use aes_gcm::aead::rand_core::RngCore;
 
-    let key_bytes = derive_key_bytes(secret_hex)?;
-    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
-    let cipher = Aes256Gcm::new(key);
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key_bytes));
 
     let mut iv_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut iv_bytes);
@@ -973,7 +931,8 @@ fn encrypt_content(plaintext: &str, secret_hex: &str) -> Result<(String, String)
     Ok((hex_encode(&ciphertext), hex_encode(iv_bytes)))
 }
 
-/// AES-256-GCM decrypt. Expects ciphertext || tag (16 bytes).
+/// AES-256-GCM decrypt with the sha256-derived key. Expects ciphertext || tag (16 bytes).
+#[cfg(test)]
 fn decrypt_content(enc_hex: &str, iv_hex: &str, secret_hex: &str) -> Result<String> {
     let key_bytes = derive_key_bytes(secret_hex)?;
     decrypt_with_key(enc_hex, iv_hex, &key_bytes)
@@ -1004,7 +963,7 @@ fn extract_token(url_or_token: &str) -> Result<String> {
         url_or_token
             .trim_end_matches('/')
             .split('/')
-            .last()
+            .next_back()
             .unwrap_or("")
     } else {
         url_or_token
@@ -1095,5 +1054,228 @@ mod tests {
         let last = enc.len() - 1;
         enc.replace_range(last.., if enc.ends_with('f') { "0" } else { "f" });
         assert!(decrypt_content(&enc, &iv, &secret).is_err());
+    }
+
+    // ── Cross-client known answers ────────────────────────────────────────────
+    // Shared with the iOS and Android suites (secret, iv and ciphertexts produced
+    // with WebCrypto).
+
+    const KAT_SECRET: &str = "00112233445566778899aabbccddeeff";
+    const KAT_IV: &str = "a1b2c3d4e5f6000102030405";
+    const KAT_SHA256: &str = "8f6ee0eb13334ea99cf53aa86bf4dc0fa4686b9c74f1bf98f3aa4bc216d70fc058ba9452266c57c681a5";
+    const KAT_PBKDF2: &str = "3ca068b802bd8f8d25145619048f5de9b50ae3319ad9bc9f6af38bd9980107a311fb228dfd0b3e6b2c24";
+    const KAT_UNICODE: &str = "c9aa7b0cd91b24f9c7982e6c0acb6233391307fc327b512c1ec87571aa62dbc5";
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn test_known_answer_keys() {
+        let cases = [
+            (KDF_SHA256, None, "a8faed6abbf35c12a4b26e40f6feb19d736d90045c83b9f9a31f638d323e6811"),
+            (KDF_PBKDF2, Some("correct horse battery staple"), "7c0123695eb46911838d4c16fa259d7280c59060c6031130b8269b624faacd02"),
+            (KDF_PBKDF2, Some("pässwörd-日本"), "2b547d9425d7d2a2dd01af3de73ec8d103c6a4f77c667f14ab406f92bbe88ac6"),
+            (KDF_PBKDF2, Some("pässwörd🔑"), "bd9dc18065862b49fcb0b4f514fbc6021c5bc751313d261bd57ea9bd7dddbf10"),
+        ];
+        for (kdf, password, want) in cases {
+            assert_eq!(hex_encode(derive_note_key(KAT_SECRET, kdf, password).unwrap()), want, "{kdf} {password:?}");
+        }
+    }
+
+    #[test]
+    fn test_pbkdf2_needs_a_password() {
+        assert!(matches!(derive_note_key(KAT_SECRET, KDF_PBKDF2, None), Err(Error::PasswordRequired)));
+        assert!(matches!(derive_note_key(KAT_SECRET, KDF_PBKDF2, Some("")), Err(Error::PasswordRequired)));
+    }
+
+    // ── HTTP behaviour against a mock server ─────────────────────────────────
+
+    use mockito::{Matcher, Server, ServerGuard};
+    use std::sync::{Arc, Mutex};
+
+    fn note_url(server: &ServerGuard) -> String {
+        format!("{}/n/{TOKEN}#{KAT_SECRET}", server.url())
+    }
+
+    fn meta_body(kdf: &str) -> String {
+        serde_json::json!({"token": TOKEN, "exists": true, "type": "note", "viewLimit": 2, "viewsRemaining": 2, "kdf": kdf}).to_string()
+    }
+
+    fn consume_body(kdf: &str, encrypted: &str) -> String {
+        serde_json::json!({"token": TOKEN, "encrypted": encrypted, "iv": KAT_IV, "kdf": kdf, "consumed": true, "viewsRemaining": 1, "destroyed": false}).to_string()
+    }
+
+    async fn mock_note(server: &mut ServerGuard, kdf: &str, encrypted: &str, consumes: usize) -> mockito::Mock {
+        server.mock("GET", format!("/api/v1/note/{TOKEN}/meta/").as_str())
+            .with_body(meta_body(kdf)).create_async().await;
+        server.mock("GET", format!("/api/v1/note/{TOKEN}/consume/").as_str())
+            .with_body(consume_body(kdf, encrypted)).expect(consumes).create_async().await
+    }
+
+    /// Mock create endpoint that keeps the request body so the test can decrypt it.
+    async fn mock_create(server: &mut ServerGuard, matcher: Matcher, auth: Matcher) -> (mockito::Mock, Arc<Mutex<Vec<u8>>>) {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        let mock = server.mock("POST", "/api/v1/note/")
+            .match_header("authorization", auth)
+            .match_body(matcher)
+            .with_status(201)
+            .with_body_from_request(move |req| {
+                let body = req.body().unwrap().clone();
+                let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                *sink.lock().unwrap() = body;
+                serde_json::json!({"token": TOKEN, "url": format!("https://voidnote.net/n/{TOKEN}"),
+                    "expiresAt": "2026-10-15 12:00:00", "viewLimit": parsed["viewLimit"], "kdf": parsed["kdf"]})
+                    .to_string().into_bytes()
+            })
+            .create_async().await;
+        (mock, captured)
+    }
+
+    fn open_created(body: &[u8], url: &str, kdf: &str, password: Option<&str>) -> String {
+        let v: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let secret = url.rsplit('#').next().unwrap();
+        let key = derive_note_key(secret, kdf, password).unwrap();
+        decrypt_with_key(v["encrypted"].as_str().unwrap(), v["iv"].as_str().unwrap(), &key).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_create_anonymous_sends_no_authorization() {
+        let mut server = Server::new_async().await;
+        let (mock, body) = mock_create(
+            &mut server,
+            Matcher::PartialJson(serde_json::json!({"expiresIn": 3600, "viewLimit": 1, "kdf": "sha256"})),
+            Matcher::Missing,
+        ).await;
+        let res = create("hello", CreateOptions { base: Some(server.url()), ..Default::default() }).await.unwrap();
+        mock.assert_async().await;
+        assert_eq!((res.kdf.as_str(), res.view_limit, res.token.as_str()), ("sha256", 1, TOKEN));
+        assert_eq!(open_created(&body.lock().unwrap(), &res.url, KDF_SHA256, None), "hello");
+    }
+
+    #[tokio::test]
+    async fn test_create_with_key_sends_bearer() {
+        let mut server = Server::new_async().await;
+        let (mock, _) = mock_create(&mut server, Matcher::Any, Matcher::Exact("Bearer vn_test".into())).await;
+        create("hello", CreateOptions { api_key: Some("vn_test".into()), base: Some(server.url()), ..Default::default() })
+            .await.unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_create_with_password_uses_pbkdf2() {
+        let mut server = Server::new_async().await;
+        let (mock, body) = mock_create(
+            &mut server,
+            Matcher::PartialJson(serde_json::json!({"expiresIn": 7200, "viewLimit": 3, "kdf": "pbkdf2-sha256-600k"})),
+            Matcher::Missing,
+        ).await;
+        let res = create("guarded", CreateOptions {
+            password: Some("pässwörd-日本".into()),
+            max_views: Some(3),
+            expires_in: Some(2),
+            base: Some(server.url()),
+            ..Default::default()
+        }).await.unwrap();
+        mock.assert_async().await;
+        assert_eq!(res.kdf, KDF_PBKDF2);
+        assert_eq!(open_created(&body.lock().unwrap(), &res.url, KDF_PBKDF2, Some("pässwörd-日本")), "guarded");
+    }
+
+    #[tokio::test]
+    async fn test_create_refuses_empty_password() {
+        let mut server = Server::new_async().await;
+        let mock = server.mock("POST", "/api/v1/note/").expect(0).create_async().await;
+        let err = create("x", CreateOptions { password: Some(String::new()), base: Some(server.url()), ..Default::default() })
+            .await.unwrap_err();
+        assert!(matches!(err, Error::EmptyPassword));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_create_surfaces_429_retry_after() {
+        let mut server = Server::new_async().await;
+        server.mock("POST", "/api/v1/note/").with_status(429).with_header("retry-after", "60")
+            .with_body(r#"{"error":"Too many notes created. Try again shortly."}"#).create_async().await;
+        let err = create("x", CreateOptions { base: Some(server.url()), ..Default::default() }).await.unwrap_err();
+        match &err {
+            Error::Http { status: 429, message, retry_after: Some(60) } => {
+                assert_eq!(message, "Too many notes created. Try again shortly.")
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(err.to_string(), "HTTP 429: Too many notes created. Try again shortly. (retry after 60s)");
+    }
+
+    #[tokio::test]
+    async fn test_create_surfaces_400_limit_message() {
+        let mut server = Server::new_async().await;
+        server.mock("POST", "/api/v1/note/").with_status(400)
+            .with_body(r#"{"error":"viewLimit must be 1–10 without an account."}"#).create_async().await;
+        let err = create("x", CreateOptions { max_views: Some(50), base: Some(server.url()), ..Default::default() })
+            .await.unwrap_err();
+        assert!(matches!(err, Error::Http { status: 400, ref message, retry_after: None } if message == "viewLimit must be 1–10 without an account."));
+    }
+
+    #[tokio::test]
+    async fn test_read_known_answers() {
+        let cases = [
+            (KDF_SHA256, KAT_SHA256, None, "voidnote-v1-sha256-kat ✓"),
+            (KDF_PBKDF2, KAT_PBKDF2, Some("correct horse battery staple"), "voidnote-v1-pbkdf2-kat ✓"),
+            (KDF_PBKDF2, KAT_UNICODE, Some("pässwörd-日本"), "unicode password"),
+        ];
+        for (kdf, encrypted, password, want) in cases {
+            let mut server = Server::new_async().await;
+            mock_note(&mut server, kdf, encrypted, 1).await;
+            let note = read_with(&note_url(&server), ReadOptions {
+                password: password.map(String::from),
+                base: Some(server.url()),
+            }).await.unwrap();
+            assert_eq!(note.content, want);
+            assert_eq!((note.kdf.as_str(), note.max_views, note.view_count), (kdf, 2, 1));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_password_note_without_password_fails_before_consume() {
+        let mut server = Server::new_async().await;
+        let consume = mock_note(&mut server, KDF_PBKDF2, KAT_PBKDF2, 0).await;
+        let err = read_from(&note_url(&server), &server.url()).await.unwrap_err();
+        assert!(matches!(err, Error::PasswordRequired));
+        consume.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_read_wrong_password() {
+        let mut server = Server::new_async().await;
+        mock_note(&mut server, KDF_PBKDF2, KAT_PBKDF2, 1).await;
+        let err = read_with(&note_url(&server), ReadOptions { password: Some("wrong".into()), base: Some(server.url()) })
+            .await.unwrap_err();
+        assert!(matches!(err, Error::DecryptionFailed));
+    }
+
+    #[tokio::test]
+    async fn test_read_unknown_kdf_fails_before_consume() {
+        let mut server = Server::new_async().await;
+        let consume = mock_note(&mut server, "argon2id", KAT_SHA256, 0).await;
+        let err = read_with(&note_url(&server), ReadOptions { password: Some("x".into()), base: Some(server.url()) })
+            .await.unwrap_err();
+        assert!(matches!(err, Error::UnsupportedKdf(ref k) if k == "argon2id"));
+        consume.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_read_missing_note() {
+        let mut server = Server::new_async().await;
+        server.mock("GET", format!("/api/v1/note/{TOKEN}/meta/").as_str())
+            .with_body(format!(r#"{{"token":"{TOKEN}","exists":false}}"#)).create_async().await;
+        let err = read_from(&note_url(&server), &server.url()).await.unwrap_err();
+        assert!(matches!(err, Error::NotFound));
+    }
+
+    #[tokio::test]
+    async fn test_peek_exposes_kdf() {
+        let mut server = Server::new_async().await;
+        mock_note(&mut server, KDF_PBKDF2, KAT_PBKDF2, 0).await;
+        let meta = peek(&note_url(&server), Some(&server.url())).await.unwrap();
+        assert_eq!((meta.kdf.as_str(), meta.views_remaining), (KDF_PBKDF2, 2));
     }
 }

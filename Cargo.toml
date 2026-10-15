@@ -1,8 +1,8 @@
 [package]
 name        = "voidnote"
-version     = "0.3.0"
+version     = "0.4.0"
 edition     = "2021"
-description = "Official Rust SDK for VoidNote — zero-knowledge self-destructing notes"
+description = "Official Rust SDK for VoidNote — zero-knowledge self-destructing notes, no account needed"
 license     = "MIT"
 repository  = "https://github.com/quantum-encoding/voidnote-rs"
 keywords    = ["voidnote", "encryption", "zero-knowledge", "self-destructing", "notes"]
@@ -27,6 +27,9 @@ aes-gcm  = "0.10"
 # SHA-256 for key derivation (pure Rust)
 sha2     = "0.10"
 
+# PBKDF2-HMAC-SHA256 for password-protected notes (pure Rust)
+pbkdf2   = { version = "0.12", default-features = false, features = ["hmac"] }
+
 # Hex encoding/decoding
 hex      = "0.4"
 
@@ -49,3 +52,14 @@ bytes = "1"
 
 [dev-dependencies]
 tokio-test = "0.4"
+mockito    = "1"
+
+
+# 600k PBKDF2 iterations take about 6 s per key in an unoptimised build; optimise the
+# key-derivation path (pbkdf2_hmac is generic, so it is compiled in this crate)
+# for this crate's own tests and examples.
+[profile.dev.package.voidnote]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
